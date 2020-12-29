@@ -1,8 +1,8 @@
 use anyhow::{ensure, Context as _, Result};
 use polyfuse::{
     op,
-    reply::{AttrOut, EntryOut, FileAttr, OpenOut, ReaddirOut},
-    KernelConfig, Operation, Request,
+    reply::{AttrOut, EntryOut, FileAttr, OpenOut, ReaddirOut, WriteOut},
+    Data, KernelConfig, Operation, Request,
 };
 use slab::Slab;
 use std::{
@@ -222,6 +222,7 @@ impl SSHFS {
 
             Operation::Open(op) => self.do_open(req, op)?,
             Operation::Read(op) => self.do_read(req, op)?,
+            Operation::Write(op, data) => self.do_write(req, op, data)?,
             Operation::Release(op) => self.do_release(req, op)?,
 
             _ => req.reply_error(libc::ENOSYS)?,
@@ -407,10 +408,6 @@ impl SSHFS {
         let span = tracing::debug_span!("open", ino = op.ino());
         let _enter = span.enter();
 
-        if op.flags() as i32 & libc::O_ACCMODE != libc::O_RDONLY {
-            return req.reply_error(libc::EACCES);
-        }
-
         let path = match self.path_table.get(op.ino()) {
             Some(path) => path,
             None => return req.reply_error(libc::EINVAL),
@@ -419,22 +416,25 @@ impl SSHFS {
         let full_path = self.base_dir.join(path);
         tracing::debug!(?full_path);
 
-        let mut file =
-            match self
-                .sftp
+        // Receive the whole content at here for simplify read/write operation.
+        let mut file = match {
+            self.sftp
                 .open_mode(&full_path, ssh2::OpenFlags::READ, 0, ssh2::OpenType::File)
-            {
-                Ok(file) => file,
-                Err(err) => return req.reply_error(ssh2_error_code(&err)),
-            };
-
-        // Receive the whole content at here for simplify read operation.
+        } {
+            Ok(file) => file,
+            Err(err) => return req.reply_error(ssh2_error_code(&err)),
+        };
         let mut content = vec![];
         if let Err(err) = file.read_to_end(&mut content) {
             return req.reply_error(err.raw_os_error().unwrap_or(libc::EIO));
         }
 
-        let fh = self.file_handles.insert(FileHandle { content }) as u64;
+        let fh = self.file_handles.insert(FileHandle {
+            size: content.len(),
+            content,
+            dirty: false,
+            full_path,
+        }) as u64;
 
         let mut out = OpenOut::default();
         out.fh(fh);
@@ -443,7 +443,7 @@ impl SSHFS {
     }
 
     fn do_read(&mut self, req: &Request, op: op::Read<'_>) -> io::Result<()> {
-        let span = tracing::debug_span!("open", ino = op.ino());
+        let span = tracing::debug_span!("read", ino = op.ino(), fh = op.fh());
         let _enter = span.enter();
 
         let offset = op.offset() as usize;
@@ -460,11 +460,54 @@ impl SSHFS {
         req.reply(content)
     }
 
+    fn do_write(&mut self, req: &Request, op: op::Write<'_>, mut data: Data<'_>) -> io::Result<()> {
+        let span = tracing::debug_span!("write", ino = op.ino(), fh = op.fh());
+        let _enter = span.enter();
+
+        let offset = op.offset() as usize;
+        let size = op.size() as usize;
+
+        let handle = match self.file_handles.get_mut(op.fh() as usize) {
+            Some(handle) => handle,
+            None => return req.reply_error(libc::EINVAL),
+        };
+
+        handle.dirty = true;
+
+        let content = &mut handle.content;
+        content.resize(std::cmp::max(content.len(), offset + size), 0);
+        data.read_exact(&mut content[offset..offset + size])?;
+
+        handle.size = offset + size;
+
+        let mut out = WriteOut::default();
+        out.size(op.size());
+
+        req.reply(out)
+    }
+
     fn do_release(&mut self, req: &Request, op: op::Release<'_>) -> io::Result<()> {
         let span = tracing::debug_span!("release", ino = op.ino());
         let _enter = span.enter();
 
-        drop(self.file_handles.remove(op.fh() as usize));
+        let handle = self.file_handles.remove(op.fh() as usize);
+        if handle.dirty {
+            let mut file = match {
+                self.sftp.open_mode(
+                    &handle.full_path,
+                    ssh2::OpenFlags::WRITE,
+                    0,
+                    ssh2::OpenType::File,
+                )
+            } {
+                Ok(file) => file,
+                Err(err) => return req.reply_error(ssh2_error_code(&err)),
+            };
+            if let Err(err) = file.write_all(&handle.content[..handle.size]) {
+                return req.reply_error(err.raw_os_error().unwrap_or(libc::EIO));
+            }
+        }
+
         req.reply(())
     }
 }
@@ -511,4 +554,7 @@ struct DirEntry {
 
 struct FileHandle {
     content: Vec<u8>,
+    size: usize,
+    dirty: bool,
+    full_path: PathBuf,
 }
