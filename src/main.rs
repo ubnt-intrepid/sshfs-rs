@@ -319,35 +319,49 @@ impl SSHFS {
         let span = tracing::debug_span!("opendir", ino = op.ino());
         let _enter = span.enter();
 
-        let path = match self.path_table.get(op.ino()) {
-            Some(path) => path,
+        let dirname = match self.path_table.get(op.ino()) {
+            Some(path) => path.to_owned(),
             None => return req.reply_error(libc::EINVAL),
         };
 
-        let full_path = self.base_dir.join(path);
-        tracing::debug!(?full_path);
+        let full_dirname = self.base_dir.join(&dirname);
+        tracing::debug!(?full_dirname);
 
-        let entries: Vec<DirEntry> = match self.sftp.readdir(&full_path) {
-            Ok(entries) => entries
-                .into_iter()
-                .filter_map(|(path, stat)| {
-                    let name = path.file_name()?;
-                    let inode = self.path_table.recognize(&path.join(name));
-                    let typ = match stat.file_type() {
-                        ft if ft.is_dir() => libc::DT_DIR as u32,
-                        ft if ft.is_file() => libc::DT_REG as u32,
-                        ft if ft.is_symlink() => libc::DT_LNK as u32,
-                        _ => libc::DT_UNKNOWN as u32,
-                    };
-                    Some(DirEntry {
-                        name: name.to_owned(),
-                        typ,
-                        ino: inode.ino,
-                    })
-                })
-                .collect(),
+        let mut dir = match self.sftp.opendir(&full_dirname) {
+            Ok(dir) => dir,
             Err(err) => return req.reply_error(ssh2_error_code(&err)),
         };
+        let mut entries: Vec<DirEntry> = vec![];
+        loop {
+            let (filename, stat) = match dir.readdir() {
+                Ok((filename, stat)) => {
+                    if filename.as_os_str() == "." || filename.as_os_str() == ".." {
+                        continue;
+                    }
+                    (filename, stat)
+                }
+
+                Err(err) => {
+                    if err.code() == ssh2::ErrorCode::Session(libssh2_sys::LIBSSH2_ERROR_FILE) {
+                        break;
+                    }
+                    return req.reply_error(ssh2_error_code(&err));
+                }
+            };
+
+            let ino = self.path_table.recognize(&dirname.join(&filename)).ino;
+
+            entries.push(DirEntry {
+                name: filename.into_os_string(),
+                ino,
+                typ: match stat.file_type() {
+                    ft if ft.is_dir() => libc::DT_DIR as u32,
+                    ft if ft.is_file() => libc::DT_REG as u32,
+                    ft if ft.is_symlink() => libc::DT_LNK as u32,
+                    _ => libc::DT_UNKNOWN as u32,
+                },
+            });
+        }
         tracing::debug!(?entries);
 
         let fh = self.dir_handles.insert(DirHandle { entries, offset: 0 }) as u64;
