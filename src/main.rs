@@ -9,12 +9,18 @@ use std::{
     collections::HashMap,
     ffi::OsString,
     io::{self, prelude::*},
-    net::{SocketAddr, TcpStream},
+    net::SocketAddr,
     path::{Path, PathBuf},
+    process::Stdio,
     time::Duration,
 };
+use tokio::{
+    io::{unix::AsyncFd, Interest},
+    process::{Child, ChildStdin, ChildStdout, Command},
+};
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::from_env().context("Failed to parse command line arguments")?;
@@ -22,43 +28,28 @@ fn main() -> Result<()> {
 
     ensure!(args.mountpoint.is_dir(), "mountpoint must be a directory");
 
-    let stream = TcpStream::connect(&args.host).context("failed to establish TCP connection")?;
+    let (mut child, r, w) = establish_connection(&args.host, &args.username)
+        .context("failed to establish SSH connection")?;
 
-    let mut ssh2 = ssh2::Session::new().context("ssh2 is not available")?;
-    ssh2.set_tcp_stream(stream);
-    ssh2.handshake()
-        .context("errored during performing SSH handshake")?;
+    let (sftp, send, recv) = sftp::init(r, w, vec![])
+        .await
+        .context("failed to initialize SFTP session")?;
+    tokio::spawn(send.run());
+    tokio::spawn(recv.run());
 
-    let mut agent = ssh2.agent().context("failed to init SSH agent handle")?;
-    agent.connect().context("failed to connect SSH agent")?;
-    agent
-        .list_identities()
-        .context("failed to fetch identities from agent")?;
-    let identities = agent
-        .identities()
-        .context("failed to get identities from SSH agent")?;
-    ensure!(!identities.is_empty(), "public keys is empty");
-    for identity in identities {
-        if let Err(..) = agent.userauth(&args.username, &identity) {
-            continue;
-        }
-    }
-    drop(agent);
-    ensure!(ssh2.authenticated(), "session is not authenticated");
+    // let stat = sftp
+    //     .lstat(&args.base_dir)
+    //     .await
+    //     .context("failed to get target attribute")?;
+    // ensure!(stat.is_dir(), "the target path is not directory");
 
-    let sftp = ssh2.sftp().context("failed to open SFTP subsystem")?;
-
-    let stat = sftp
-        .lstat(&args.base_dir)
-        .context("failed to get target attribute")?;
-    ensure!(stat.is_dir(), "the target path is not directory");
-
-    let fuse = polyfuse::Session::mount(args.mountpoint, {
+    let fuse = AsyncSession::mount(args.mountpoint, {
         let mut config = KernelConfig::default();
         config.mount_option("fsname=sshfs");
         config.mount_option("default_permissions");
         config
     })
+    .await
     .context("failed to start FUSE session")?;
 
     let mut sshfs = SSHFS {
@@ -71,12 +62,17 @@ fn main() -> Result<()> {
 
     while let Some(req) = fuse
         .next_request()
+        .await
         .context("failed to receive FUSE request")?
     {
         sshfs
             .handle_request(&req)
+            .await
             .context("failed to send FUSE reply")?;
     }
+
+    child.kill().await.context("failed to send kill")?;
+    child.wait().await?;
 
     Ok(())
 }
@@ -197,33 +193,33 @@ impl PathTable {
 // ==== SSHFS ====
 
 struct SSHFS {
-    sftp: ssh2::Sftp,
+    sftp: sftp::Session,
     base_dir: PathBuf,
     path_table: PathTable,
     dir_handles: Slab<DirHandle>,
-    file_handles: Slab<FileHandle>,
+    file_handles: Slab<sftp::FileHandle>,
 }
 
 impl SSHFS {
-    fn handle_request(&mut self, req: &Request) -> Result<()> {
+    async fn handle_request(&mut self, req: &Request) -> Result<()> {
         let span = tracing::debug_span!("handle_request", unique = req.unique());
         let _enter = span.enter();
 
         match req.operation()? {
-            Operation::Lookup(op) => self.do_lookup(req, op)?,
+            Operation::Lookup(op) => self.do_lookup(req, op).await?,
             Operation::Forget(forgets) => self.do_forget(forgets.as_ref()),
 
-            Operation::Getattr(op) => self.do_getattr(req, op)?,
-            Operation::Readlink(op) => self.do_readlink(req, op)?,
+            Operation::Getattr(op) => self.do_getattr(req, op).await?,
+            Operation::Readlink(op) => self.do_readlink(req, op).await?,
 
-            Operation::Opendir(op) => self.do_opendir(req, op)?,
+            Operation::Opendir(op) => self.do_opendir(req, op).await?,
             Operation::Readdir(op) => self.do_readdir(req, op)?,
             Operation::Releasedir(op) => self.do_releasedir(req, op)?,
 
-            Operation::Open(op) => self.do_open(req, op)?,
-            Operation::Read(op) => self.do_read(req, op)?,
-            Operation::Write(op, data) => self.do_write(req, op, data)?,
-            Operation::Release(op) => self.do_release(req, op)?,
+            Operation::Open(op) => self.do_open(req, op).await?,
+            Operation::Read(op) => self.do_read(req, op).await?,
+            Operation::Write(op, data) => self.do_write(req, op, data).await?,
+            Operation::Release(op) => self.do_release(req, op).await?,
 
             _ => req.reply_error(libc::ENOSYS)?,
         }
@@ -231,7 +227,7 @@ impl SSHFS {
         Ok(())
     }
 
-    fn do_lookup(&mut self, req: &Request, op: op::Lookup<'_>) -> io::Result<()> {
+    async fn do_lookup(&mut self, req: &Request, op: op::Lookup<'_>) -> io::Result<()> {
         let span = tracing::debug_span!("lookup", parent = op.parent(), name = ?op.name());
         let _enter = span.enter();
 
@@ -243,9 +239,9 @@ impl SSHFS {
         let full_path = self.base_dir.join(&path);
         tracing::debug!(?full_path);
 
-        let stat = match self.sftp.lstat(&full_path) {
+        let stat = match self.sftp.lstat(&full_path).await {
             Ok(stat) => stat,
-            Err(err) => return req.reply_error(ssh2_error_code(&err)),
+            Err(err) => return req.reply_error(sftp_error_to_errno(&err)),
         };
 
         let inode = self.path_table.recognize(&path);
@@ -271,7 +267,7 @@ impl SSHFS {
         }
     }
 
-    fn do_getattr(&mut self, req: &Request, op: op::Getattr<'_>) -> io::Result<()> {
+    async fn do_getattr(&mut self, req: &Request, op: op::Getattr<'_>) -> io::Result<()> {
         let span = tracing::debug_span!("getattr", ino = op.ino());
         let _enter = span.enter();
 
@@ -283,9 +279,9 @@ impl SSHFS {
         let full_path = self.base_dir.join(path);
         tracing::debug!(?full_path);
 
-        let stat = match self.sftp.lstat(&full_path) {
+        let stat = match self.sftp.lstat(&full_path).await {
             Ok(stat) => stat,
-            Err(err) => return req.reply_error(ssh2_error_code(&err)),
+            Err(err) => return req.reply_error(sftp_error_to_errno(&err)),
         };
 
         let mut out = AttrOut::default();
@@ -296,7 +292,7 @@ impl SSHFS {
         req.reply(out)
     }
 
-    fn do_readlink(&mut self, req: &Request, op: op::Readlink<'_>) -> io::Result<()> {
+    async fn do_readlink(&mut self, req: &Request, op: op::Readlink<'_>) -> io::Result<()> {
         let span = tracing::debug_span!("readlink", ino = op.ino());
         let _enter = span.enter();
 
@@ -308,15 +304,15 @@ impl SSHFS {
         let full_path = self.base_dir.join(path);
         tracing::debug!(?full_path);
 
-        let link = match self.sftp.readlink(&full_path) {
+        let link = match self.sftp.readlink(&full_path).await {
             Ok(link) => link,
-            Err(err) => return req.reply_error(ssh2_error_code(&err)),
+            Err(err) => return req.reply_error(sftp_error_to_errno(&err)),
         };
 
-        req.reply(link.into_os_string())
+        req.reply(link)
     }
 
-    fn do_opendir(&mut self, req: &Request, op: op::Opendir<'_>) -> io::Result<()> {
+    async fn do_opendir(&mut self, req: &Request, op: op::Opendir<'_>) -> io::Result<()> {
         let span = tracing::debug_span!("opendir", ino = op.ino());
         let _enter = span.enter();
 
@@ -328,41 +324,39 @@ impl SSHFS {
         let full_dirname = self.base_dir.join(&dirname);
         tracing::debug!(?full_dirname);
 
-        let mut dir = match self.sftp.opendir(&full_dirname) {
+        let dir = match self.sftp.opendir(&full_dirname).await {
             Ok(dir) => dir,
-            Err(err) => return req.reply_error(ssh2_error_code(&err)),
+            Err(err) => return req.reply_error(sftp_error_to_errno(&err)),
         };
-        let mut entries: Vec<DirEntry> = vec![];
-        loop {
-            let (filename, stat) = match dir.readdir() {
-                Ok((filename, stat)) => {
-                    if filename.as_os_str() == "." || filename.as_os_str() == ".." {
+
+        let entries: Vec<DirEntry> = match self.sftp.readdir(&dir).await {
+            Ok(entries) => {
+                let mut dst = vec![];
+                for entry in entries {
+                    if entry.filename == "." || entry.filename == ".." {
                         continue;
                     }
-                    (filename, stat)
+
+                    let ino = self
+                        .path_table
+                        .recognize(&dirname.join(&entry.filename))
+                        .ino;
+
+                    dst.push(DirEntry {
+                        name: entry.filename,
+                        ino,
+                        typ: libc::DT_UNKNOWN as u32,
+                    });
                 }
+                dst
+            }
 
-                Err(err) => {
-                    if err.code() == ssh2::ErrorCode::Session(libssh2_sys::LIBSSH2_ERROR_FILE) {
-                        break;
-                    }
-                    return req.reply_error(ssh2_error_code(&err));
-                }
-            };
+            Err(sftp::Error::Remote(err)) if err.code() == sftp::consts::SSH_FX_EOF => {
+                vec![]
+            }
 
-            let ino = self.path_table.recognize(&dirname.join(&filename)).ino;
-
-            entries.push(DirEntry {
-                name: filename.into_os_string(),
-                ino,
-                typ: match stat.file_type() {
-                    ft if ft.is_dir() => libc::DT_DIR as u32,
-                    ft if ft.is_file() => libc::DT_REG as u32,
-                    ft if ft.is_symlink() => libc::DT_LNK as u32,
-                    _ => libc::DT_UNKNOWN as u32,
-                },
-            });
-        }
+            Err(err) => return req.reply_error(sftp_error_to_errno(&err)),
+        };
         tracing::debug!(?entries);
 
         let fh = self.dir_handles.insert(DirHandle { entries, offset: 0 }) as u64;
@@ -404,7 +398,7 @@ impl SSHFS {
         req.reply(())
     }
 
-    fn do_open(&mut self, req: &Request, op: op::Open<'_>) -> io::Result<()> {
+    async fn do_open(&mut self, req: &Request, op: op::Open<'_>) -> io::Result<()> {
         let span = tracing::debug_span!("open", ino = op.ino());
         let _enter = span.enter();
 
@@ -416,25 +410,19 @@ impl SSHFS {
         let full_path = self.base_dir.join(path);
         tracing::debug!(?full_path);
 
-        // Receive the whole content at here for simplify read/write operation.
-        let mut file = match {
-            self.sftp
-                .open_mode(&full_path, ssh2::OpenFlags::READ, 0, ssh2::OpenType::File)
-        } {
-            Ok(file) => file,
-            Err(err) => return req.reply_error(ssh2_error_code(&err)),
+        let pflags = match op.flags() as i32 & libc::O_ACCMODE {
+            libc::O_RDONLY => sftp::consts::SSH_FXF_READ,
+            libc::O_WRONLY => sftp::consts::SSH_FXF_WRITE,
+            libc::O_RDWR => sftp::consts::SSH_FXF_READ | sftp::consts::SSH_FXF_WRITE,
+            _ => 0,
         };
-        let mut content = vec![];
-        if let Err(err) = file.read_to_end(&mut content) {
-            return req.reply_error(err.raw_os_error().unwrap_or(libc::EIO));
-        }
 
-        let fh = self.file_handles.insert(FileHandle {
-            size: content.len(),
-            content,
-            dirty: false,
-            full_path,
-        }) as u64;
+        let handle = match self.sftp.open(&full_path, pflags, Default::default()).await {
+            Ok(file) => file,
+            Err(err) => return req.reply_error(sftp_error_to_errno(&err)),
+        };
+
+        let fh = self.file_handles.insert(handle) as u64;
 
         let mut out = OpenOut::default();
         out.fh(fh);
@@ -442,101 +430,60 @@ impl SSHFS {
         req.reply(out)
     }
 
-    fn do_read(&mut self, req: &Request, op: op::Read<'_>) -> io::Result<()> {
+    async fn do_read(&mut self, req: &Request, op: op::Read<'_>) -> io::Result<()> {
         let span = tracing::debug_span!("read", ino = op.ino(), fh = op.fh());
         let _enter = span.enter();
 
-        let offset = op.offset() as usize;
-        let size = op.size() as usize;
-
-        let handle = match self.file_handles.get_mut(op.fh() as usize) {
+        let handle = match self.file_handles.get(op.fh() as usize) {
             Some(handle) => handle,
             None => return req.reply_error(libc::EINVAL),
         };
 
-        let content = handle.content.get(offset..).unwrap_or(&[]);
-        let content = &content[..std::cmp::min(content.len(), size)];
-
-        req.reply(content)
+        match self.sftp.read(&handle, op.offset(), op.size()).await {
+            Ok(data) => req.reply(data),
+            Err(err) => req.reply_error(sftp_error_to_errno(&err)),
+        }
     }
 
-    fn do_write(&mut self, req: &Request, op: op::Write<'_>, mut data: Data<'_>) -> io::Result<()> {
+    async fn do_write(
+        &mut self,
+        req: &Request,
+        op: op::Write<'_>,
+        mut data: Data<'_>,
+    ) -> io::Result<()> {
         let span = tracing::debug_span!("write", ino = op.ino(), fh = op.fh());
         let _enter = span.enter();
 
-        let offset = op.offset() as usize;
-        let size = op.size() as usize;
-
-        let handle = match self.file_handles.get_mut(op.fh() as usize) {
+        let handle = match self.file_handles.get(op.fh() as usize) {
             Some(handle) => handle,
             None => return req.reply_error(libc::EINVAL),
         };
 
-        handle.dirty = true;
+        let mut content = vec![];
+        data.by_ref()
+            .take(op.size() as u64)
+            .read_to_end(&mut content)?;
 
-        let content = &mut handle.content;
-        content.resize(std::cmp::max(content.len(), offset + size), 0);
-        data.read_exact(&mut content[offset..offset + size])?;
-
-        handle.size = offset + size;
-
-        let mut out = WriteOut::default();
-        out.size(op.size());
-
-        req.reply(out)
+        match self.sftp.write(&handle, op.offset(), &content).await {
+            Ok(()) => {
+                let mut out = WriteOut::default();
+                out.size(op.size());
+                req.reply(out)
+            }
+            Err(err) => req.reply_error(sftp_error_to_errno(&err)),
+        }
     }
 
-    fn do_release(&mut self, req: &Request, op: op::Release<'_>) -> io::Result<()> {
+    async fn do_release(&mut self, req: &Request, op: op::Release<'_>) -> io::Result<()> {
         let span = tracing::debug_span!("release", ino = op.ino());
         let _enter = span.enter();
 
         let handle = self.file_handles.remove(op.fh() as usize);
-        if handle.dirty {
-            let mut file = match {
-                self.sftp.open_mode(
-                    &handle.full_path,
-                    ssh2::OpenFlags::WRITE,
-                    0,
-                    ssh2::OpenType::File,
-                )
-            } {
-                Ok(file) => file,
-                Err(err) => return req.reply_error(ssh2_error_code(&err)),
-            };
-            if let Err(err) = file.write_all(&handle.content[..handle.size]) {
-                return req.reply_error(err.raw_os_error().unwrap_or(libc::EIO));
-            }
+
+        match self.sftp.close(&handle).await {
+            Ok(()) => req.reply(()),
+            Err(err) => req.reply_error(sftp_error_to_errno(&err)),
         }
-
-        req.reply(())
-    }
-}
-
-fn fill_attr(attr: &mut FileAttr, st: &ssh2::FileStat) {
-    attr.size(st.size.unwrap_or(0));
-    attr.mode(st.perm.unwrap_or(0));
-    attr.uid(st.uid.unwrap_or(0));
-    attr.gid(st.gid.unwrap_or(0));
-    attr.atime(Duration::from_secs(st.atime.unwrap_or(0)));
-    attr.mtime(Duration::from_secs(st.mtime.unwrap_or(0)));
-
-    attr.nlink(1);
-}
-
-fn ssh2_error_code(err: &ssh2::Error) -> i32 {
-    use libssh2_sys as raw;
-    use ssh2::ErrorCode;
-
-    match err.code() {
-        ErrorCode::SFTP(raw::LIBSSH2_FX_NO_SUCH_FILE) => libc::ENOENT,
-        ErrorCode::SFTP(raw::LIBSSH2_FX_PERMISSION_DENIED) => libc::EPERM,
-        ErrorCode::SFTP(raw::LIBSSH2_FX_OP_UNSUPPORTED) => libc::ENOTSUP,
-        ErrorCode::SFTP(raw::LIBSSH2_FX_NO_SUCH_PATH) => libc::ENOENT,
-        ErrorCode::SFTP(raw::LIBSSH2_FX_FILE_ALREADY_EXISTS) => libc::EEXIST,
-        ErrorCode::SFTP(raw::LIBSSH2_FX_DIR_NOT_EMPTY) => libc::ENOTEMPTY,
-        ErrorCode::SFTP(raw::LIBSSH2_FX_NOT_A_DIRECTORY) => libc::ENOTDIR,
-        ErrorCode::SFTP(raw::LIBSSH2_FX_INVALID_FILENAME) => libc::EINVAL,
-        _ => libc::EIO,
     }
 }
 
@@ -552,9 +499,79 @@ struct DirEntry {
     ino: u64,
 }
 
-struct FileHandle {
-    content: Vec<u8>,
-    size: usize,
-    dirty: bool,
-    full_path: PathBuf,
+fn fill_attr(attr: &mut FileAttr, st: &sftp::FileAttr) {
+    attr.size(st.size.unwrap_or(0));
+    attr.mode(st.permissions.unwrap_or(0));
+    attr.uid(st.uid().unwrap_or(0));
+    attr.gid(st.gid().unwrap_or(0));
+    attr.atime(Duration::from_secs(st.atime().unwrap_or(0).into()));
+    attr.mtime(Duration::from_secs(st.mtime().unwrap_or(0).into()));
+
+    attr.nlink(1);
+}
+
+fn sftp_error_to_errno(err: &sftp::Error) -> i32 {
+    use sftp::consts::*;
+    match err {
+        sftp::Error::Remote(err) => match err.code() {
+            SSH_FX_OK => 0,
+            SSH_FX_NO_SUCH_FILE => libc::ENOENT,
+            SSH_FX_PERMISSION_DENIED => libc::EPERM,
+            SSH_FX_OP_UNSUPPORTED => libc::ENOTSUP,
+            _ => libc::EIO,
+        },
+        _ => libc::EIO,
+    }
+}
+
+fn establish_connection(
+    addr: &SocketAddr,
+    username: &str,
+) -> Result<(Child, ChildStdout, ChildStdin)> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-p")
+        .arg(addr.port().to_string())
+        .arg(format!("{}@{}", username, addr.ip().to_string()))
+        .args(&["-s", "sftp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+
+    tracing::debug!("spawn {:?}", cmd);
+    let mut child = cmd.spawn().context("failed to spawn ssh")?;
+
+    let reader = child.stdout.take().expect("missing stdout pipe");
+    let writer = child.stdin.take().expect("missing stdin pipe");
+
+    Ok((child, reader, writer))
+}
+
+// ==== AsyncSession ====
+
+struct AsyncSession {
+    inner: AsyncFd<polyfuse::Session>,
+}
+
+impl AsyncSession {
+    async fn mount(mountpoint: PathBuf, config: KernelConfig) -> io::Result<Self> {
+        tokio::task::spawn_blocking(move || {
+            let session = polyfuse::Session::mount(mountpoint, config)?;
+            Ok(Self {
+                inner: AsyncFd::with_interest(session, Interest::READABLE)?,
+            })
+        })
+        .await
+        .expect("join error")
+    }
+
+    async fn next_request(&self) -> io::Result<Option<Request>> {
+        use futures::{future::poll_fn, ready, task::Poll};
+        poll_fn(|cx| {
+            let mut guard = ready!(self.inner.poll_read_ready(cx))?;
+            match guard.try_io(|inner| inner.get_ref().next_request()) {
+                Err(_would_block) => Poll::Pending,
+                Ok(res) => Poll::Ready(res),
+            }
+        })
+        .await
+    }
 }
