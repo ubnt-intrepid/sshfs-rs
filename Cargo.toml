@@ -1,18 +1,22 @@
 [package]
-name = "sshfs-rs"
+name = "sshfs"
 version = "0.1.0"
 publish = false
 authors = [ "Yusuke Sasaki <yusuke.sasaki.nuem@gmail.com>" ]
 edition = "2018"
+description = "A SSHFS implementation written in Rust"
 
 [dependencies]
 anyhow = "1"
+bitflags = "1.2"
+bytes = "1"
+dashmap = "3"
 futures = "0.3"
 libc = "0.2"
 pico-args = "0.3"
 polyfuse = "0.4"
-sftp = { git = "https://github.com/ubnt-intrepid/sftp-rs.git", rev = "fbcdaea" }
 slab = "0.4"
+thiserror = "1"
 tokio = { version = "1", features = [ "full" ] }
 tracing = "0.1"
 tracing-subscriber = "0.1"

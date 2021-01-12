@@ -1,4 +1,11 @@
+mod sftp;
+
 use anyhow::{ensure, Context as _, Result};
+use futures::{
+    future::poll_fn,
+    ready,
+    task::{self, Poll},
+};
 use polyfuse::{
     op,
     reply::{AttrOut, EntryOut, FileAttr, OpenOut, ReaddirOut, WriteOut},
@@ -11,13 +18,15 @@ use std::{
     io::{self, prelude::*},
     net::SocketAddr,
     path::{Path, PathBuf},
+    pin::Pin,
     process::Stdio,
     time::Duration,
 };
 use tokio::{
-    io::{unix::AsyncFd, Interest},
+    io::{unix::AsyncFd, AsyncRead, AsyncWrite, Interest, ReadBuf},
     process::{Child, ChildStdin, ChildStdout, Command},
 };
+use tracing::Instrument as _;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -28,14 +37,13 @@ async fn main() -> Result<()> {
 
     ensure!(args.mountpoint.is_dir(), "mountpoint must be a directory");
 
-    let (mut child, r, w) = establish_connection(&args.host, &args.username)
+    let (mut child, stream) = establish_connection(&args.host, &args.username)
         .context("failed to establish SSH connection")?;
 
-    let (sftp, send, recv) = sftp::init(r, w, vec![])
+    let (sftp, conn) = crate::sftp::init(stream)
         .await
         .context("failed to initialize SFTP session")?;
-    tokio::spawn(send.run());
-    tokio::spawn(recv.run());
+    tokio::spawn(conn.instrument(tracing::debug_span!("sftp_connection")));
 
     // let stat = sftp
     //     .lstat(&args.base_dir)
@@ -351,7 +359,7 @@ impl SSHFS {
                 dst
             }
 
-            Err(sftp::Error::Remote(err)) if err.code() == sftp::consts::SSH_FX_EOF => {
+            Err(sftp::Error::Remote(err)) if err.code() == sftp::SSH_FX_EOF => {
                 vec![]
             }
 
@@ -359,10 +367,16 @@ impl SSHFS {
         };
         tracing::debug!(?entries);
 
+        match self.sftp.close(&dir).await {
+            Ok(()) => (),
+            Err(err) => return req.reply_error(sftp_error_to_errno(&err)),
+        }
+
         let fh = self.dir_handles.insert(DirHandle { entries, offset: 0 }) as u64;
 
         let mut out = OpenOut::default();
         out.fh(fh);
+        out.direct_io(true);
 
         req.reply(out)
     }
@@ -411,15 +425,22 @@ impl SSHFS {
         tracing::debug!(?full_path);
 
         let pflags = match op.flags() as i32 & libc::O_ACCMODE {
-            libc::O_RDONLY => sftp::consts::SSH_FXF_READ,
-            libc::O_WRONLY => sftp::consts::SSH_FXF_WRITE,
-            libc::O_RDWR => sftp::consts::SSH_FXF_READ | sftp::consts::SSH_FXF_WRITE,
-            _ => 0,
+            libc::O_RDONLY => sftp::OpenFlag::READ,
+            libc::O_WRONLY => sftp::OpenFlag::WRITE,
+            libc::O_RDWR => sftp::OpenFlag::READ | sftp::OpenFlag::WRITE,
+            _ => sftp::OpenFlag::empty(),
         };
 
-        let handle = match self.sftp.open(&full_path, pflags, Default::default()).await {
+        let handle = match self
+            .sftp
+            .open(&full_path, pflags, &Default::default())
+            .await
+        {
             Ok(file) => file,
-            Err(err) => return req.reply_error(sftp_error_to_errno(&err)),
+            Err(err) => {
+                tracing::error!("reply_err({:?})", err);
+                return req.reply_error(sftp_error_to_errno(&err));
+            }
         };
 
         let fh = self.file_handles.insert(handle) as u64;
@@ -464,7 +485,7 @@ impl SSHFS {
             .take(op.size() as u64)
             .read_to_end(&mut content)?;
 
-        match self.sftp.write(&handle, op.offset(), &content).await {
+        match self.sftp.write(&handle, op.offset(), &content[..]).await {
             Ok(()) => {
                 let mut out = WriteOut::default();
                 out.size(op.size());
@@ -511,38 +532,16 @@ fn fill_attr(attr: &mut FileAttr, st: &sftp::FileAttr) {
 }
 
 fn sftp_error_to_errno(err: &sftp::Error) -> i32 {
-    use sftp::consts::*;
     match err {
         sftp::Error::Remote(err) => match err.code() {
-            SSH_FX_OK => 0,
-            SSH_FX_NO_SUCH_FILE => libc::ENOENT,
-            SSH_FX_PERMISSION_DENIED => libc::EPERM,
-            SSH_FX_OP_UNSUPPORTED => libc::ENOTSUP,
+            sftp::SSH_FX_OK => 0,
+            sftp::SSH_FX_NO_SUCH_FILE => libc::ENOENT,
+            sftp::SSH_FX_PERMISSION_DENIED => libc::EPERM,
+            sftp::SSH_FX_OP_UNSUPPORTED => libc::ENOTSUP,
             _ => libc::EIO,
         },
         _ => libc::EIO,
     }
-}
-
-fn establish_connection(
-    addr: &SocketAddr,
-    username: &str,
-) -> Result<(Child, ChildStdout, ChildStdin)> {
-    let mut cmd = Command::new("ssh");
-    cmd.arg("-p")
-        .arg(addr.port().to_string())
-        .arg(format!("{}@{}", username, addr.ip().to_string()))
-        .args(&["-s", "sftp"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped());
-
-    tracing::debug!("spawn {:?}", cmd);
-    let mut child = cmd.spawn().context("failed to spawn ssh")?;
-
-    let reader = child.stdout.take().expect("missing stdout pipe");
-    let writer = child.stdin.take().expect("missing stdin pipe");
-
-    Ok((child, reader, writer))
 }
 
 // ==== AsyncSession ====
@@ -564,7 +563,6 @@ impl AsyncSession {
     }
 
     async fn next_request(&self) -> io::Result<Option<Request>> {
-        use futures::{future::poll_fn, ready, task::Poll};
         poll_fn(|cx| {
             let mut guard = ready!(self.inner.poll_read_ready(cx))?;
             match guard.try_io(|inner| inner.get_ref().next_request()) {
@@ -574,4 +572,67 @@ impl AsyncSession {
         })
         .await
     }
+}
+
+// ==== SSH connection ====
+
+struct Stream {
+    reader: ChildStdout,
+    writer: ChildStdin,
+}
+
+impl AsyncRead for Stream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().reader).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Stream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().writer).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().writer).poll_write_vectored(cx, bufs)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().writer).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().writer).poll_shutdown(cx)
+    }
+}
+
+fn establish_connection(addr: &SocketAddr, username: &str) -> Result<(Child, Stream)> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-p")
+        .arg(addr.port().to_string())
+        .arg(format!("{}@{}", username, addr.ip().to_string()))
+        .args(&["-s", "sftp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+
+    tracing::debug!("spawn {:?}", cmd);
+    let mut child = cmd.spawn().context("failed to spawn ssh")?;
+
+    let stream = Stream {
+        reader: child.stdout.take().expect("missing stdout pipe"),
+        writer: child.stdin.take().expect("missing stdin pipe"),
+    };
+
+    Ok((child, stream))
 }
